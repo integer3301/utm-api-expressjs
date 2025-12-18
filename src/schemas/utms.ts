@@ -12,8 +12,13 @@ export const Utms = sqliteTable("utm_servers", {
     .default("arm")
     .notNull(),
 
-  createdAt: text("created_at").$defaultFn(() => new Date().toISOString()),
-  updatedAt: text("updated_at").$defaultFn(() => new Date().toISOString()),
+  createdAt: integer("created_at", { mode: "timestamp" }).$defaultFn(
+    () => new Date()
+  ),
+
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .$defaultFn(() => new Date())
+    .$onUpdateFn(() => new Date()),
 });
 
 export const getUtmUrl = (utm: Pick<Utm, "ip" | "port">, protocol = "http") => {

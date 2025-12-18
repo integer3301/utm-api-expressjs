@@ -11,14 +11,17 @@ export class UtmRepository {
     const row = await db.select().from(Utms).where(eq(Utms.id, id)).get();
     return row ?? null;
   }
-  async delete(id: number): Promise<boolean> { 
-    const row = await db.delete(Utms).where(eq(Utms.id, id)).returning().get();
-    return !!row;
+  async delete(id: number): Promise<boolean> {
+    const exists = await this.findById(id);
+    if (!exists) return false;
+    await db.delete(Utms).where(eq(Utms.id, id)).run();
+
+    return true;
   }
 
   async create(data: NewUtm): Promise<Utm> {
     const row = await db
-      .insert(Utms) 
+      .insert(Utms)
       .values({
         name: data.name,
         ip: data.ip,
@@ -35,9 +38,8 @@ export class UtmRepository {
   async update(id: number, data: Partial<NewUtm>): Promise<Utm | null> {
     const row = await db
       .update(Utms)
-      .set({ 
-        ...data, 
-        updatedAt: new Date().toISOString() 
+      .set({
+        ...data,
       })
       .where(eq(Utms.id, id))
       .returning()

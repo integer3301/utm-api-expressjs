@@ -5,20 +5,25 @@ import cors from "@elysiajs/cors";
 import { UtmController } from "./controllers/utm.controllers";
 import { UtmRepository } from "./repositories/utm.repository";
 import { UtmService } from "./services/utm.service";
+import { MonitoringService } from "./services/monitoring.service";
 
 const utmRepository = new UtmRepository();
-const utmService = new UtmService(utmRepository);
+const monitoringService = new MonitoringService();
+
+const utmService = new UtmService(utmRepository, monitoringService);
 
 const app = new Elysia()
   .use(
     cors({
-      origin: "http://localhost:5173", 
+      origin: "http://localhost:5173",
       allowedHeaders: ["Content-Type", "Authorization"],
       methods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
     })
   )
   .use(logger())
-  .group("/api/v1", (app) => app.use(UtmController(utmService)))
+  .group("/api/v1", (app) =>
+    app.use(UtmController(utmService, monitoringService))
+  )
 
   .listen(3000);
 

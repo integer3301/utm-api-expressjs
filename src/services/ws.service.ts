@@ -1,30 +1,40 @@
 import { logger } from "../utils/logger";
 
+const STOMP_COMMANDS = {
+  CONNECT: "CONNECT\naccept-version:1.1,1.0\nheart-beat:10000,10000\n\n\0",
+  SUBSCRIBE_DOCS: "SUBSCRIBE\nid:sub-0\ndestination:/app/documents\n\n\0",
+  SUBSCRIBE_TOPIC: "SUBSCRIBE\nid:sub-1\ndestination:/topic/documents\n\n\0",
+};
+
+const RECONNECT_INTERVALS = {
+  ERROR: 10000,
+  CLOSE: 5000,
+};
+
 export type WebSocketHandlers = {
   onMessage: (data: any) => void;
   onStatusChange: (status: "online" | "offline") => void;
 };
 
+interface ServerConfig {
+  id: number;
+  ip: string;
+  port: number;
+}
+
 type ActiveConnection = {
   ws: WebSocket | null;
-  reconnectTimer: any;
+  reconnectTimer: ReturnType<typeof setTimeout> | null;
   isTerminated: boolean;
 };
 
 export class WebSocketService {
   private connections = new Map<number, ActiveConnection>();
 
-  public connect(
-    server: { id: number; ip: string; port: number }, // id
-    handlers: WebSocketHandlers
-  ) {
-    
+  public connect(server: ServerConfig, handlers: WebSocketHandlers) {
     const { id, ip, port } = server;
 
-    if (this.connections.has(id)) {
-      this.disconnectById(id);
-    }
-
+    this.disconnectById(id);
 
     const connectionState: ActiveConnection = {
       ws: null,
@@ -33,105 +43,125 @@ export class WebSocketService {
     };
     this.connections.set(id, connectionState);
 
-
     const run = async () => {
-      
       if (connectionState.isTerminated) return;
 
       try {
-        const infoRes = await fetch(
-          `http://${ip}:${port}/websocket/info?t=${Date.now()}`
-        );
-        const info = await infoRes.json();
         const sid = Math.random().toString(36).substring(2, 10);
         const wsUrl = `ws://${ip}:${port}/websocket/000/${sid}/websocket`;
-        logger.info(
-          `Respone: websocket=${info.websocket}, cookie_needed=${info.cookie_needed}`
-        );
+
+        await fetch(`http://${ip}:${port}/websocket/info?t=${Date.now()}`);
+
         const ws = new WebSocket(wsUrl);
-        connectionState.ws = ws; 
+        connectionState.ws = ws;
 
-        ws.onopen = () => {
-          ws.send(
-            JSON.stringify([
-              "CONNECT\naccept-version:1.1,1.0\nheart-beat:10000,10000\n\n\0",
-            ])
-          );
-        };
-
-        ws.onmessage = (event) => {
-          const msg = event.data.toString();
-          if (msg === "h") return;
-          if (msg.startsWith("a[")) {
-            const stompFrame = JSON.parse(msg.slice(1))[0];
-
-            if (stompFrame.startsWith("CONNECTED")) {
-              handlers.onStatusChange("online");
-              ws.send(
-                JSON.stringify([
-                  "SUBSCRIBE\nid:sub-0\ndestination:/app/documents\n\n\0",
-                ])
-              );
-              ws.send(
-                JSON.stringify([
-                  "SUBSCRIBE\nid:sub-1\ndestination:/topic/documents\n\n\0",
-                ])
-              );
-              logger.info(`Connected: ${ip}:${port} success`)
-            }
-
-            if (stompFrame.startsWith("MESSAGE")) {
-              const body = stompFrame.split("\n\n")[1]?.split("\0")[0];
-              if (body) {
-                try {
-                  handlers.onMessage(JSON.parse(body));
-                  logger.info(JSON.parse(body))
-                } catch (e) {
-                  logger.error(`Error parsing from ${ip}: ${e}`);
-                }
-              }
-            }
-          }
-        };
-
-        ws.onclose = () => {
-          handlers.onStatusChange("offline");
-          if (!connectionState.isTerminated) {
-            clearTimeout(connectionState.reconnectTimer);
-            connectionState.reconnectTimer = setTimeout(run, 5000);
-          }
-        };
-
-        ws.onerror = () => ws.close();
+        this.setupEventListeners(ws, server, handlers, connectionState, run);
       } catch (err) {
-        const reason = err.name === 'AbortError' ? 'Timeout' : err.message;
-        logger.error(`Error connected ${ip}:${port} (${reason})`);
-        
-        handlers.onStatusChange("offline");
-        
-        if (!connectionState.isTerminated) {
-          clearTimeout(connectionState.reconnectTimer);
-          connectionState.reconnectTimer = setTimeout(run, 10000);
-        }
+        this.handleError(server, handlers, connectionState, run, err);
       }
     };
-    logger.info(`Register run() for ${ip}`); // ЛОГ 4
+
+    logger.info(`Register connection for ${ip}:${port}`);
     run();
+  }
+
+  private setupEventListeners(
+    ws: WebSocket,
+    server: ServerConfig,
+    handlers: WebSocketHandlers,
+    state: ActiveConnection,
+    reconnectFn: () => void
+  ) {
+    ws.onopen = () => {
+      this.sendStompFrame(ws, STOMP_COMMANDS.CONNECT);
+    };
+
+    ws.onmessage = (event) => {
+      this.processMessage(event.data.toString(), ws, handlers, server);
+    };
+
+    ws.onclose = () => {
+      handlers.onStatusChange("offline");
+      this.scheduleReconnect(state, reconnectFn, RECONNECT_INTERVALS.CLOSE);
+    };
+
+    ws.onerror = () => ws.close();
+  }
+
+  private processMessage(
+    msg: string,
+    ws: WebSocket,
+    handlers: WebSocketHandlers,
+    server: ServerConfig
+  ) {
+    if (msg === "h") return; // Heartbeat
+    if (!msg.startsWith("a[")) return;
+
+    try {
+      const stompFrame = JSON.parse(msg.slice(1))[0];
+
+      if (stompFrame.startsWith("CONNECTED")) {
+        handlers.onStatusChange("online");
+        this.sendStompFrame(ws, STOMP_COMMANDS.SUBSCRIBE_DOCS);
+        this.sendStompFrame(ws, STOMP_COMMANDS.SUBSCRIBE_TOPIC);
+        logger.info(`Connected to ${server.ip} success`);
+      }
+
+      if (stompFrame.startsWith("MESSAGE")) {
+        const body = stompFrame.split("\n\n")[1]?.split("\0")[0];
+        if (body) {
+          const parsedData = JSON.parse(body);
+          handlers.onMessage(parsedData);
+        }
+      }
+    } catch (e) {
+      logger.error(`Parsing error from ${server.ip}: ${e}`);
+    }
+  }
+
+  private sendStompFrame(ws: WebSocket, frame: string) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify([frame]));
+    }
+  }
+
+  private handleError(
+    server: ServerConfig,
+    handlers: WebSocketHandlers,
+    state: ActiveConnection,
+    reconnectFn: () => void,
+    err: any
+  ) {
+    const reason = err instanceof Error ? err.message : "Unknown error";
+    logger.error(`Connection error ${server.ip}:${server.port} (${reason})`);
+
+    handlers.onStatusChange("offline");
+    this.scheduleReconnect(state, reconnectFn, RECONNECT_INTERVALS.ERROR);
+  }
+
+  private scheduleReconnect(
+    state: ActiveConnection,
+    reconnectFn: () => void,
+    delay: number
+  ) {
+    if (state.isTerminated) return;
+    if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = setTimeout(reconnectFn, delay);
   }
 
   public disconnectById(id: number) {
     const conn = this.connections.get(id);
-    if (conn) {
-      logger.info(`Stop monitoring: ${id}`);
-      conn.isTerminated = true;
-      clearTimeout(conn.reconnectTimer);
+    if (!conn) return;
 
-      if (conn.ws) {
-        conn.ws.onclose = null;
-        conn.ws.close();
-      }
+    logger.info(`Stopping connection: ${id}`);
+    conn.isTerminated = true;
+    if (conn.reconnectTimer) clearTimeout(conn.reconnectTimer);
 
-      this.connections.delete(id);
+    if (conn.ws) {
+      conn.ws.onclose = null;
+      conn.ws.close();
     }
+
+    this.connections.delete(id);
   }
 }
